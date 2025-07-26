@@ -1,38 +1,34 @@
 const std = @import("std");
+const ExpiryManager = @import("expiry.zig").ExpiryManager;
 
-const User: type = struct {
-    conn: std.net.Server.Connection,
-    store: *std.StringHashMap(*Entry),
-    storeMutex: *std.Thread.Mutex,
-    allocator: std.mem.Allocator,
-};
+const User = @import("user_ctx.zig").User;
+const Entry = @import("user_ctx.zig").Entry;
 
 const Header = struct {
     command: []const u8,
-    key:     []const u8,
-    flags:   []const u8,
-    exptime: []const u8,
-    bytes:   usize,
+    key: []const u8,
+    flags: []const u8,
+    exptime: i64,
+    bytes: usize,
 
     pub fn parse(line: []const u8) !Header {
         var iter = std.mem.splitScalar(u8, line, ' ');
         const c = iter.next() orelse return error.InvalidHeader;
         const k = iter.next() orelse return error.InvalidHeader;
         const f = iter.next() orelse "0";
-        const e = iter.next() orelse "0";
+        const e_str = iter.next() orelse "0";
         const b_str = iter.next() orelse "0";
+        const e = std.fmt.parseInt(i64, e_str, 10) catch return error.InvalidHeader;
         const b = std.fmt.parseInt(usize, b_str, 10) catch return error.InvalidHeader;
-        return Header{ .command = c, .key = k, .flags = f, .exptime = e, .bytes = b };
+        return Header{
+            .command = c,
+            .key = k,
+            .flags = f,
+            .exptime = e,
+            .bytes = b
+        };
     }
 };
-
-const Entry = struct {
-    key: []const u8,
-    flags: []const u8,
-    bytes: usize,
-    value: []const u8,
-};
-
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -53,6 +49,9 @@ pub fn main() !void {
         std.debug.assert(gpa.deinit() == .ok);
     }
 
+    const expiryManager = try ExpiryManager.init(allocator, &store, &mutex);
+    try expiryManager.spawnWorker();
+
     while (true) {
         const user = User{
             .conn = server.accept() catch |err| {
@@ -63,20 +62,22 @@ pub fn main() !void {
             .storeMutex = &mutex,
             .allocator = allocator,
         };
-        _ = try std.Thread.spawn(.{}, handler, .{user});
+
+        _ = try std.Thread.spawn(.{}, handler, .{user, expiryManager});
     }
 }
 
-fn handler(user: User) !void {
+fn handler(user: User, expManager: *ExpiryManager) !void {
     defer {
         user.conn.stream.close();
     }
-    const reader = user.conn.stream.reader();
+    // const reader = user.conn.stream.reader();
     const writer = user.conn.stream.writer();
+    var bufio = std.io.bufferedReader(user.conn.stream.reader());
+    var reader = bufio.reader();
     var buf: [4096]u8 = undefined;
 
     while (true) {
-        //baca header
         const readData = try reader.readUntilDelimiterOrEof(&buf, '\n');
         const dataResult = readData orelse {
             try writer.print("-ERR empty data json\r\n", .{});
@@ -88,10 +89,9 @@ fn handler(user: User) !void {
 
         //pakek reference karena nanti akses iterator.next() ki ngubah data
         if (std.mem.eql(u8, header.command, "SET")) {
-
-          _ = handleSet(header,reader, user, writer) catch break;
+            _ = handleSet(header, reader, user, writer, expManager) catch break;
         } else if (std.mem.eql(u8, header.command, "GET")) {
-            _ = handleGet(header,user, writer) catch break;
+            _ = handleGet(header, user, writer) catch break;
         } else if (std.mem.eql(u8, header.command, "DEL")) {
             _ = handleDel(header, user, writer) catch break;
         } else {
@@ -100,18 +100,15 @@ fn handler(user: User) !void {
     }
 }
 
-
 fn normalizeLine(line: []const u8) []const u8 {
     var start: usize = 0;
     var end: usize = line.len;
 
-    //untuk unix, mac, linux \r, \n, \r\n
     if (end >= 2 and line[end - 2] == '\r' and line[end - 1] == '\n') {
         end -= 2;
     } else if (end > 0 and (line[end - 1] == '\r' or line[end - 1] == '\n')) {
         end -= 1;
     }
-    //menghilangkan semua \r atau \n bila ditemukan diawal bila ada
     while (start < end and (line[start] == '\r' or line[start] == '\n')) {
         start += 1;
     }
@@ -119,12 +116,12 @@ fn normalizeLine(line: []const u8) []const u8 {
     return line[start..end];
 }
 
-//parameter e baca file e, ketok kok nanti tipe return e opo, terus jadikan parameter
 fn handleSet(
     header: Header,
-    reader: std.net.Stream.Reader,
+    reader: anytype,
     user: User,
     writer: std.net.Stream.Writer,
+    expManager: *ExpiryManager,
 ) !void {
     var valueBuf = try user.allocator.alloc(u8, header.bytes + 2);
     defer user.allocator.free(valueBuf);
@@ -169,6 +166,11 @@ fn handleSet(
     };
     user.storeMutex.unlock();
 
+    if (header.exptime != 0) {
+        const expireAt = std.time.timestamp() + header.exptime;
+        try expManager.registerExpiry(header.key, expireAt);
+    }
+
     try writer.print("+OK\r\n", .{});
 }
 
@@ -184,7 +186,7 @@ fn handleGet(
     user.storeMutex.unlock();
 
     if (result) |val| {
-        try writer.print("{s} {s} {d}\r\n", .{ val.key, val.flags, val.bytes});
+        try writer.print("{s} {s} {d}\r\n", .{ val.key, val.flags, val.bytes });
         try writer.writeAll(val.value);
         try writer.print("\r\n", .{});
     } else {
@@ -193,7 +195,7 @@ fn handleGet(
 }
 
 fn handleDel(
-    header:Header,
+    header: Header,
     user: User,
     writer: std.net.Stream.Writer,
 ) !void {

@@ -1,4 +1,6 @@
 const std = @import("std");
+const coro = @import("coro");
+
 const ExpiryManager = @import("expiry.zig").ExpiryManager;
 
 const User = @import("user_ctx.zig").User;
@@ -43,7 +45,14 @@ pub fn main() !void {
     var server = try addr.listen(.{});
     std.debug.print("🔴 Listening on 0.0.0.0:6060\n", .{});
 
+    //lib coro buat ganti thread.spawn
+    var scheduler = try coro.Scheduler.init(gpa.allocator(), .{});
+    var pool = try coro.ThreadPool.init(gpa.allocator(), .{});
+
     defer {
+        scheduler.deinit();
+        pool.deinit();
+
         server.deinit();
         store.deinit();
         std.debug.assert(gpa.deinit() == .ok);
@@ -63,8 +72,11 @@ pub fn main() !void {
             .allocator = allocator,
         };
 
-        _ = try std.Thread.spawn(.{}, handler, .{user, expiryManager});
+        // _ = try std.Thread.spawn(.{}, handler, .{user, expiryManager});
+        // _ = try scheduler.spawn(handler, .{user, expiryManager}, .{});
+        _ = try pool.spawnForCompletion(&scheduler, handler, .{user, expiryManager});
     }
+    try scheduler.run(.wait);
 }
 
 fn handler(user: User, expManager: *ExpiryManager) !void {

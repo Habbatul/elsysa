@@ -17,6 +17,7 @@ pub const ExpiryManager = struct {
     queue: std.PriorityQueue(ExpiryEntry, void, compare),
     store: *std.StringHashMap(*Entry),
     storeMutex: *std.Thread.Mutex,
+    queueMutex: std.Thread.Mutex,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -29,12 +30,15 @@ pub const ExpiryManager = struct {
             .queue = std.PriorityQueue(ExpiryEntry, void, compare).init(allocator, {}),
             .store = store,
             .storeMutex = storeMutex,
+            .queueMutex = std.Thread.Mutex{},
         };
         return self;
     }
 
     pub fn registerExpiry(self: *ExpiryManager, key: []const u8, expireAt: i64) !void {
         const key_copy = try self.allocator.dupe(u8, key);
+        self.queueMutex.lock();
+        defer self.queueMutex.unlock();
         try self.queue.add(ExpiryEntry{ .key = key_copy, .expireAt = expireAt });
     }
 

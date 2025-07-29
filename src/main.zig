@@ -1,5 +1,4 @@
 const std = @import("std");
-const coro = @import("coro");
 
 const ExpiryManager = @import("expiry.zig").ExpiryManager;
 
@@ -33,8 +32,7 @@ const Header = struct {
 };
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = gpa.allocator();
+    const allocator = std.heap.page_allocator;
 
     //init everything
     var store = std.StringHashMap(*Entry).init(allocator);
@@ -45,20 +43,12 @@ pub fn main() !void {
     var server = try addr.listen(.{});
     std.debug.print("🔴 Listening on 0.0.0.0:6060\n", .{});
 
-    //lib coro buat ganti thread.spawn
-    var scheduler = try coro.Scheduler.init(gpa.allocator(), .{});
-    var pool = try coro.ThreadPool.init(gpa.allocator(), .{});
-
     defer {
-        scheduler.deinit();
-        pool.deinit();
-
         server.deinit();
         store.deinit();
-        std.debug.assert(gpa.deinit() == .ok);
     }
 
-    const expiryManager = try ExpiryManager.init(allocator, &store, &mutex);
+    const expiryManager = try ExpiryManager.init( allocator, &store, &mutex);
     try expiryManager.spawnWorker();
 
     while (true) {
@@ -72,11 +62,8 @@ pub fn main() !void {
             .allocator = allocator,
         };
 
-        // _ = try std.Thread.spawn(.{}, handler, .{user, expiryManager});
-        // _ = try scheduler.spawn(handler, .{user, expiryManager}, .{});
-        _ = try pool.spawnForCompletion(&scheduler, handler, .{user, expiryManager});
+        _ = try std.Thread.spawn(.{}, handler, .{user, expiryManager});
     }
-    try scheduler.run(.wait);
 }
 
 fn handler(user: User, expManager: *ExpiryManager) !void {
@@ -99,7 +86,6 @@ fn handler(user: User, expManager: *ExpiryManager) !void {
 
         const header = try Header.parse(line);
 
-        //pakek reference karena nanti akses iterator.next() ki ngubah data
         if (std.mem.eql(u8, header.command, "SET")) {
             _ = handleSet(header, reader, user, writer, expManager) catch break;
         } else if (std.mem.eql(u8, header.command, "GET")) {
@@ -150,8 +136,6 @@ fn handleSet(
         try writer.print("-ERR value must end with \\r\\n\r\n", .{});
         return;
     }
-
-    // std.debug.print("Set Key: {s}\r\n", .{header.key});
 
     const value = valueBuf[0 .. header.bytes];
 

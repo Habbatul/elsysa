@@ -48,8 +48,14 @@ pub fn main() !void {
         store.deinit();
     }
 
-    const expiryManager = try ExpiryManager.init( allocator, &store, &mutex);
-    try expiryManager.spawnWorker();
+    const threadCount = try std.Thread.getCpuCount();
+    var pool : std.Thread.Pool = undefined;
+    try pool.init(.{
+        .allocator = allocator,
+        .n_jobs = threadCount,
+    });
+
+    defer pool.deinit();
 
     while (true) {
         const user = User{
@@ -62,11 +68,17 @@ pub fn main() !void {
             .allocator = allocator,
         };
 
-        _ = try std.Thread.spawn(.{}, handler, .{user, expiryManager});
+        _ = try pool.spawn(handlerCannotErr, .{user});
     }
 }
 
-fn handler(user: User, expManager: *ExpiryManager) !void {
+fn handlerCannotErr(user: User) void {
+    handler(user) catch |err| {
+        std.log.debug("ada error di handler: {s}\n", .{@errorName(err)});
+    };
+}
+
+fn handler(user: User) !void {
     defer {
         user.conn.stream.close();
     }
@@ -87,7 +99,7 @@ fn handler(user: User, expManager: *ExpiryManager) !void {
         const header = try Header.parse(line);
 
         if (std.mem.eql(u8, header.command, "SET")) {
-            _ = handleSet(header, reader, user, writer, expManager) catch break;
+            _ = handleSet(header, reader, user, writer) catch break;
         } else if (std.mem.eql(u8, header.command, "GET")) {
             _ = handleGet(header, user, writer) catch break;
         } else if (std.mem.eql(u8, header.command, "DEL")) {
@@ -119,7 +131,6 @@ fn handleSet(
     reader: anytype,
     user: User,
     writer: std.net.Stream.Writer,
-    expManager: *ExpiryManager,
 ) !void {
     var valueBuf = try user.allocator.alloc(u8, header.bytes + 2);
     defer user.allocator.free(valueBuf);
@@ -161,11 +172,6 @@ fn handleSet(
         return error.FailedToPut;
     };
     user.storeMutex.unlock();
-
-    if (header.exptime != 0) {
-        const expireAt = std.time.timestamp() + header.exptime;
-        try expManager.registerExpiry(header.key, expireAt);
-    }
 
     try writer.print("+OK\r\n", .{});
 }

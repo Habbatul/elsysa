@@ -1,7 +1,5 @@
 const std = @import("std");
 
-const ExpiryManager = @import("expiry.zig").ExpiryManager;
-
 const User = @import("user_ctx.zig").User;
 const Entry = @import("user_ctx.zig").Entry;
 
@@ -26,21 +24,21 @@ const Header = struct {
             .key = k,
             .flags = f,
             .exptime = e,
-            .bytes = b
+            .bytes = b,
         };
     }
 };
 
 pub fn main() !void {
-    const allocator = std.heap.page_allocator;
+    var gpa: std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }) = .{};
+    defer std.debug.assert(gpa.deinit() == .ok);
+    const allocator = gpa.allocator();
 
-    //init everything
     var store = std.StringHashMap(*Entry).init(allocator);
     var mutex: std.Thread.Mutex = .{};
 
-    //init tcp listener
     var addr = try std.net.Address.parseIp("0.0.0.0", 6060);
-    var server = try addr.listen(.{});
+    var server = try addr.listen(.{ .kernel_backlog = 1024 });
     std.debug.print("🔴 Listening on 0.0.0.0:6060\n", .{});
 
     defer {
@@ -49,7 +47,7 @@ pub fn main() !void {
     }
 
     const threadCount = try std.Thread.getCpuCount();
-    var pool : std.Thread.Pool = undefined;
+    var pool: std.Thread.Pool = undefined;
     try pool.init(.{
         .allocator = allocator,
         .n_jobs = threadCount,
@@ -68,21 +66,24 @@ pub fn main() !void {
             .allocator = allocator,
         };
 
-        _ = try pool.spawn(handlerCannotErr, .{user});
+        try pool.spawn(handlerCannotErr, .{user});
     }
 }
 
 fn handlerCannotErr(user: User) void {
-    handler(user) catch |err| {
+    var arena = std.heap.ArenaAllocator.init(user.allocator);
+    defer arena.deinit();
+    const arenaAlloc = arena.allocator();
+
+    handler(user, arenaAlloc) catch |err| {
         std.log.debug("ada error di handler: {s}\n", .{@errorName(err)});
     };
 }
 
-fn handler(user: User) !void {
+fn handler(user: User, arenaAlloc: std.mem.Allocator) !void {
     defer {
         user.conn.stream.close();
     }
-    // const reader = user.conn.stream.reader();
     const writer = user.conn.stream.writer();
     var bufio = std.io.bufferedReader(user.conn.stream.reader());
     var reader = bufio.reader();
@@ -99,7 +100,7 @@ fn handler(user: User) !void {
         const header = try Header.parse(line);
 
         if (std.mem.eql(u8, header.command, "SET")) {
-            _ = handleSet(header, reader, user, writer) catch break;
+            _ = handleSet(header, reader, user, writer, arenaAlloc) catch break;
         } else if (std.mem.eql(u8, header.command, "GET")) {
             _ = handleGet(header, user, writer) catch break;
         } else if (std.mem.eql(u8, header.command, "DEL")) {
@@ -131,9 +132,10 @@ fn handleSet(
     reader: anytype,
     user: User,
     writer: std.net.Stream.Writer,
+    arenaAlloc: std.mem.Allocator,
 ) !void {
-    var valueBuf = try user.allocator.alloc(u8, header.bytes + 2);
-    defer user.allocator.free(valueBuf);
+    var valueBuf = try arenaAlloc.alloc(u8, header.bytes + 2);
+
     var start: usize = 0;
     while (start < header.bytes + 2) {
         const n = try reader.read(valueBuf[start..]);
@@ -148,7 +150,10 @@ fn handleSet(
         return;
     }
 
-    const value = valueBuf[0 .. header.bytes];
+    const value = valueBuf[0..header.bytes];
+
+    user.storeMutex.lock();
+    defer user.storeMutex.unlock();
 
     const keyCpy = try user.allocator.dupe(u8, header.key);
     const valCpy = try user.allocator.dupe(u8, value);
@@ -159,10 +164,12 @@ fn handleSet(
         .key = keyCpy,
         .flags = flagCpy,
         .bytes = header.bytes,
-        .value = valCpy
+        .value = valCpy,
     };
 
-    user.storeMutex.lock();
+
+    const removedEntry = user.store.fetchRemove(header.key);
+
     _ = user.store.put(keyCpy, entry) catch {
         user.storeMutex.unlock();
         user.allocator.free(keyCpy);
@@ -171,7 +178,13 @@ fn handleSet(
         user.allocator.destroy(entry);
         return error.FailedToPut;
     };
-    user.storeMutex.unlock();
+      
+    if (removedEntry) |oldEntry| {
+        user.allocator.free(oldEntry.value.key);
+        user.allocator.free(oldEntry.value.flags);
+        user.allocator.free(oldEntry.value.value);
+        user.allocator.destroy(oldEntry.value);
+    }
 
     try writer.print("+OK\r\n", .{});
 }
@@ -212,9 +225,9 @@ fn handleDel(
         user.allocator.free(val.value.flags);
         user.allocator.free(val.value.value);
         user.allocator.destroy(val.value);
-        // std.debug.print("{s} {s}", .{val.key, val.key});
         try writer.print(":1\r\n", .{});
     } else {
         try writer.print(":0\r\n", .{});
     }
 }
+

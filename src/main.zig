@@ -86,11 +86,12 @@ fn handler(user: User, arenaAlloc: std.mem.Allocator) !void {
     }
     const writer = user.conn.stream.writer();
     var bufio = std.io.bufferedReader(user.conn.stream.reader());
-    var reader = bufio.reader();
-    var buf: [4096]u8 = undefined;
+    const reader = bufio.reader();
+    // var buf: [4096]u8 = undefined;
 
     while (true) {
-        const readData = try reader.readUntilDelimiterOrEof(&buf, '\n');
+        // const readData = try reader.readUntilDelimiterOrEof(&buf, '\n');
+        const readData = try readLineSIMD(&bufio);
         const dataResult = readData orelse {
             try writer.print("-ERR empty data json\r\n", .{});
             break;
@@ -110,6 +111,71 @@ fn handler(user: User, arenaAlloc: std.mem.Allocator) !void {
         }
     }
 }
+
+pub fn readLineSIMD(buffered: anytype) !?[]u8 {
+    const target:u8 = '\n';
+    const chunkSize:usize = 16;
+    const Vec = @Vector(chunkSize, u8);
+
+    while (true){
+        const start = buffered.start;
+        const end = buffered.end;
+
+        if (start == end){
+            const n = try buffered.unbuffered_reader.read(buffered.buf[0..]);
+            if (n == 0) return null;
+            buffered.start = 0;
+            buffered.end = n;
+            continue;
+        }
+
+        const sliceToProcess = buffered.buf[start..end];
+        const targetVec: Vec = @splat(target);
+
+        var i:usize = 0;
+        while (i + chunkSize <= sliceToProcess.len) : (i += chunkSize) {
+            // const vec = std.mem.bytesToValue(Vec, sliceToProcess[i..i+chunkSize]);
+            // const mask = vec == targetVec;
+            const vec: *Vec = @alignCast(@ptrCast(sliceToProcess[i..i+chunkSize])); 
+            const mask = vec.* == targetVec;
+            const intMask:u16 = @bitCast(mask);
+
+
+            if (intMask != 0) {
+                const newLineOffsite = @ctz(intMask);
+                const posInSlice = i+newLineOffsite;
+
+                buffered.start += posInSlice+1;
+                return sliceToProcess[0..posInSlice];
+            }
+        }
+
+        var j = i;
+        while (j < sliceToProcess.len) : (j += 1) {
+            if (sliceToProcess[j] == target) {
+                buffered.start += j+1;
+                return sliceToProcess[0..j];
+            }
+        }
+
+        const remainingSlice = sliceToProcess[i..];
+        @memcpy(buffered.buf[0..remainingSlice.len], remainingSlice);
+        buffered.start = 0;
+        buffered.end = remainingSlice.len;
+
+        const n = try buffered.unbuffered_reader.read(buffered.buf[remainingSlice.len..]);
+        if (n == 0) {
+            if (buffered.end == 0) return null;
+            const line = buffered.buf[0..buffered.end];
+            buffered.start = buffered.end;
+            return line;
+        }
+        buffered.end += n;
+
+    }
+
+}
+
 
 fn normalizeLine(line: []const u8) []const u8 {
     var start: usize = 0;
@@ -230,4 +296,3 @@ fn handleDel(
         try writer.print(":0\r\n", .{});
     }
 }
-

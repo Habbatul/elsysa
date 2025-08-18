@@ -1,3 +1,12 @@
+// --- INVESTIGATION RECORD ---
+// Issue: Memory leak detected in this implementation.
+// Summary: Over 100 attempts were made to resolve the leak using various approaches.
+// Keywords explored during experimentation: libuv, zig-aio, MCSP, heap memory management, stack vs heap, etc.
+// All modifications were ultimately discarded, as they resulted in over-engineering without improving performance or resolving the memory leak.
+// <<Maybe this sounds like an exaggeration, but I'm genuinely tired.>>
+// Reminder for myself: Further investigation is postponed until Zig 0.15.1 is officially released.
+
+
 const std = @import("std");
 
 const User = @import("user_ctx.zig").User;

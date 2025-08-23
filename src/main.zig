@@ -1,16 +1,18 @@
-// --- INVESTIGATION RECORD ---
-// Issue: Memory leak detected in this implementation.
-// Summary: Over 100 attempts were made to resolve the leak using various approaches.
-// Keywords explored during experimentation: libuv, zig-aio, MCSP, heap memory management, stack vs heap, etc.
-// All modifications were ultimately discarded, as they resulted in over-engineering without improving performance or resolving the memory leak.
-// <<Maybe this sounds like an exaggeration, but I'm genuinely tired.>>
-// Reminder for myself: Further investigation is postponed until Zig 0.15.1 is officially released.
-
-
 const std = @import("std");
 
-const User = @import("user_ctx.zig").User;
-const Entry = @import("user_ctx.zig").Entry;
+pub const User = struct {
+    conn: std.net.Server.Connection,
+    store: *std.StringHashMap(*Entry),
+    storeMutex: *std.Thread.Mutex,
+    allocator: std.mem.Allocator,
+};
+
+pub const Entry = struct {
+    key: []const u8,
+    flags: []const u8,
+    bytes: usize,
+    value: []const u8,
+};
 
 const Header = struct {
     command: []const u8,
@@ -33,36 +35,36 @@ const Header = struct {
             .key = k,
             .flags = f,
             .exptime = e,
-            .bytes = b,
+            .bytes = b
         };
     }
 };
 
+
 pub fn main() !void {
-    var gpa: std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }) = .{};
-    defer std.debug.assert(gpa.deinit() == .ok);
+    var gpa:std.heap.GeneralPurposeAllocator(.{.thread_safe = true, .MutexType = std.Thread.Mutex,}) = .init;
     const allocator = gpa.allocator();
 
     var store = std.StringHashMap(*Entry).init(allocator);
     var mutex: std.Thread.Mutex = .{};
 
     var addr = try std.net.Address.parseIp("0.0.0.0", 6060);
-    var server = try addr.listen(.{ .kernel_backlog = 1024 });
+    var server = try addr.listen(.{.kernel_backlog = 1024});
     std.debug.print("🔴 Listening on 0.0.0.0:6060\n", .{});
 
-    defer {
-        server.deinit();
-        store.deinit();
-    }
-
     const threadCount = try std.Thread.getCpuCount();
-    var pool: std.Thread.Pool = undefined;
+    var pool : std.Thread.Pool = undefined;
     try pool.init(.{
         .allocator = allocator,
         .n_jobs = threadCount,
     });
 
-    defer pool.deinit();
+    defer {
+        server.deinit();
+        store.deinit();
+        pool.deinit();
+        if (gpa.deinit() == .leak){}
+    }
 
     while (true) {
         const user = User{
@@ -74,6 +76,7 @@ pub fn main() !void {
             .storeMutex = &mutex,
             .allocator = allocator,
         };
+        
 
         try pool.spawn(handlerCannotErr, .{user});
     }
@@ -82,109 +85,79 @@ pub fn main() !void {
 fn handlerCannotErr(user: User) void {
     var arena = std.heap.ArenaAllocator.init(user.allocator);
     defer arena.deinit();
-    const arenaAlloc = arena.allocator();
+    const arenaAllocator = arena.allocator();
 
-    handler(user, arenaAlloc) catch |err| {
-        std.log.debug("ada error di handler: {s}\n", .{@errorName(err)});
+    const userPtr = arenaAllocator.create(User) catch |err| {
+        std.log.err("ada error di alloc user struct {}\n", .{err});
+        return;
+    }; 
+
+    userPtr.* = user;
+
+
+    handler(userPtr.*, arenaAllocator) catch  {
+        // std.log.debug("ada error di handler: {s}\n", .{@errorName(err)});
     };
 }
 
 fn handler(user: User, arenaAlloc: std.mem.Allocator) !void {
-    defer {
-        user.conn.stream.close();
-    }
-    const writer = user.conn.stream.writer();
-    var bufio = std.io.bufferedReader(user.conn.stream.reader());
-    const reader = bufio.reader();
-    // var buf: [4096]u8 = undefined;
+    defer user.conn.stream.close();
 
-    while (true) {
-        // const readData = try reader.readUntilDelimiterOrEof(&buf, '\n');
-        const readData = try readLineSIMD(&bufio);
-        const dataResult = readData orelse {
-            try writer.print("-ERR empty data json\r\n", .{});
-            break;
+    const bufSize = 1024*1024*2;
+    const readBuffer = try arenaAlloc.alloc(u8, bufSize);
+    const writeBuffer = try arenaAlloc.alloc(u8, bufSize);
+    
+    // var readBuffer: [bufSize]u8 = undefined; 
+    // var writeBuffer: [bufSize]u8 = undefined;
+    //
+    var streamReader = user.conn.stream.reader(readBuffer);
+    const reader = &streamReader.interface_state;
+
+    var streamWriter = user.conn.stream.writer(writeBuffer);
+    const writer = &streamWriter.interface;
+
+    mainLoop:while (true) {
+
+        const rawLine = reader.takeDelimiterExclusive('\n') catch |err| switch (err) {
+            error.EndOfStream => break:mainLoop,
+            else => {
+                std.log.err("gatay la{}\n", .{err});
+                return err;
+            },
         };
-        const line = normalizeLine(dataResult);
-
-        const header = try Header.parse(line);
-
-        if (std.mem.eql(u8, header.command, "SET")) {
-            _ = handleSet(header, reader, user, writer, arenaAlloc) catch break;
-        } else if (std.mem.eql(u8, header.command, "GET")) {
-            _ = handleGet(header, user, writer) catch break;
-        } else if (std.mem.eql(u8, header.command, "DEL")) {
-            _ = handleDel(header, user, writer) catch break;
-        } else {
-            writer.print("-ERR command not available\r\n", .{}) catch break;
-        }
-    }
-}
-
-pub fn readLineSIMD(buffered: anytype) !?[]u8 {
-    const target:u8 = '\n';
-    const chunkSize:usize = 16;
-    const Vec = @Vector(chunkSize, u8);
-
-    while (true){
-        const start = buffered.start;
-        const end = buffered.end;
-
-        if (start == end){
-            const n = try buffered.unbuffered_reader.read(buffered.buf[0..]);
-            if (n == 0) return null;
-            buffered.start = 0;
-            buffered.end = n;
+            
+        const line = normalizeLine(rawLine);
+        const header = Header.parse(line) catch {
+            try writer.print("-ERR invalid command format\r\n", .{});
+            try writer.flush();
             continue;
+        };
+        
+        if (std.mem.eql(u8, header.command, "SET")) {
+            _ = handleSet(header, reader, user, writer, arenaAlloc) catch |err| {
+                std.log.err("{}\n", .{err});
+                break;
+            };
+        } else if (std.mem.eql(u8, header.command, "GET")) {
+            _ = handleGet(header, user, writer) catch |err| {
+                std.log.err("{}\n", .{err});
+                break;
+            };
+        } else if (std.mem.eql(u8, header.command, "DEL")) {
+            _ = handleDel(header, user, writer) catch |err| {
+                std.log.err("{}\n", .{err});
+                break;
+            };
+        } else {
+            std.log.err("gatau lah command nya : {s}\n",.{header.command});
+            try writer.print("-ERR command not available\r\n", .{});
+            try writer.flush(); 
         }
 
-        const sliceToProcess = buffered.buf[start..end];
-        const targetVec: Vec = @splat(target);
-
-        var i:usize = 0;
-        while (i + chunkSize <= sliceToProcess.len) : (i += chunkSize) {
-            // const vec = std.mem.bytesToValue(Vec, sliceToProcess[i..i+chunkSize]);
-            // const mask = vec == targetVec;
-            const vec: *Vec = @alignCast(@ptrCast(sliceToProcess[i..i+chunkSize])); 
-            const mask = vec.* == targetVec;
-            const intMask:u16 = @bitCast(mask);
-
-
-            if (intMask != 0) {
-                const newLineOffsite = @ctz(intMask);
-                const posInSlice = i+newLineOffsite;
-
-                buffered.start += posInSlice+1;
-                return sliceToProcess[0..posInSlice];
-            }
-        }
-
-        var j = i;
-        while (j < sliceToProcess.len) : (j += 1) {
-            if (sliceToProcess[j] == target) {
-                buffered.start += j+1;
-                return sliceToProcess[0..j];
-            }
-        }
-
-        const remainingSlice = sliceToProcess[i..];
-        @memcpy(buffered.buf[0..remainingSlice.len], remainingSlice);
-        buffered.start = 0;
-        buffered.end = remainingSlice.len;
-
-        const n = try buffered.unbuffered_reader.read(buffered.buf[remainingSlice.len..]);
-        if (n == 0) {
-            if (buffered.end == 0) return null;
-            const line = buffered.buf[0..buffered.end];
-            buffered.start = buffered.end;
-            return line;
-        }
-        buffered.end += n;
-
-    }
+        try writer.flush();
+    } 
 
 }
-
 
 fn normalizeLine(line: []const u8) []const u8 {
     var start: usize = 0;
@@ -204,22 +177,14 @@ fn normalizeLine(line: []const u8) []const u8 {
 
 fn handleSet(
     header: Header,
-    reader: anytype,
+    reader: *std.Io.Reader,
     user: User,
-    writer: std.net.Stream.Writer,
+    writer: *std.Io.Writer,
     arenaAlloc: std.mem.Allocator,
 ) !void {
     var valueBuf = try arenaAlloc.alloc(u8, header.bytes + 2);
+    try reader.*.readSliceAll(valueBuf);
 
-    var start: usize = 0;
-    while (start < header.bytes + 2) {
-        const n = try reader.read(valueBuf[start..]);
-        if (n == 0) {
-            try writer.print("-ERR unexpected EOF\r\n", .{});
-            return;
-        }
-        start += n;
-    }
     if (!(valueBuf[header.bytes] == '\r' and valueBuf[header.bytes + 1] == '\n')) {
         try writer.print("-ERR value must end with \\r\\n\r\n", .{});
         return;
@@ -230,6 +195,7 @@ fn handleSet(
     user.storeMutex.lock();
     defer user.storeMutex.unlock();
 
+
     const keyCpy = try user.allocator.dupe(u8, header.key);
     const valCpy = try user.allocator.dupe(u8, value);
     const flagCpy = try user.allocator.dupe(u8, header.flags);
@@ -239,9 +205,8 @@ fn handleSet(
         .key = keyCpy,
         .flags = flagCpy,
         .bytes = header.bytes,
-        .value = valCpy,
+        .value = valCpy
     };
-
 
     const removedEntry = user.store.fetchRemove(header.key);
 
@@ -254,6 +219,7 @@ fn handleSet(
         return error.FailedToPut;
     };
       
+    
     if (removedEntry) |oldEntry| {
         user.allocator.free(oldEntry.value.key);
         user.allocator.free(oldEntry.value.flags);
@@ -267,7 +233,7 @@ fn handleSet(
 fn handleGet(
     header: Header,
     user: User,
-    writer: std.net.Stream.Writer,
+    writer: *std.Io.Writer,
 ) !void {
     const key = header.key;
 
@@ -282,12 +248,13 @@ fn handleGet(
     } else {
         try writer.print("$-1\r\n", .{});
     }
+
 }
 
 fn handleDel(
     header: Header,
     user: User,
-    writer: std.net.Stream.Writer,
+    writer: *std.Io.Writer,
 ) !void {
     const key = header.key;
 

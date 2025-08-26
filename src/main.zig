@@ -42,9 +42,10 @@ const Header = struct {
 
 
 pub fn main() !void {
-    var gpa:std.heap.GeneralPurposeAllocator(.{.thread_safe = true, .MutexType = std.Thread.Mutex,}) = .init;
-    const allocator = gpa.allocator();
+    // var gpa:std.heap.GeneralPurposeAllocator(.{.thread_safe = true, .MutexType = std.Thread.Mutex,}) = .init;
+    // const allocator = gpa.allocator();
 
+    const allocator = std.heap.raw_c_allocator;
     var store = std.StringHashMap(*Entry).init(allocator);
     var mutex: std.Thread.Mutex = .{};
 
@@ -63,7 +64,7 @@ pub fn main() !void {
         server.deinit();
         store.deinit();
         pool.deinit();
-        if (gpa.deinit() == .leak){}
+        // if (gpa.deinit() == .leak){}
     }
 
     while (true) {
@@ -103,17 +104,18 @@ fn handlerCannotErr(user: User) void {
 fn handler(user: User, arenaAlloc: std.mem.Allocator) !void {
     defer user.conn.stream.close();
 
-    const bufSize = 1024*1024*2;
-    const readBuffer = try arenaAlloc.alloc(u8, bufSize);
-    const writeBuffer = try arenaAlloc.alloc(u8, bufSize);
-    
-    // var readBuffer: [bufSize]u8 = undefined; 
-    // var writeBuffer: [bufSize]u8 = undefined;
-    //
-    var streamReader = user.conn.stream.reader(readBuffer);
+    // const readBuffer = try arenaAlloc.alloc(u8, 8192);
+    // const writeBuffer = try arenaAlloc.alloc(u8, 8192);
+
+    const READ_BUF_SIZE = 64 * 1024;
+    var readBuffer:[READ_BUF_SIZE]u8 = undefined;
+    const WRITE_BUF_SIZE = 64 * 1024;
+    var writeBuffer:[WRITE_BUF_SIZE]u8 = undefined;
+
+    var streamReader = user.conn.stream.reader(&readBuffer);
     const reader = &streamReader.interface_state;
 
-    var streamWriter = user.conn.stream.writer(writeBuffer);
+    var streamWriter = user.conn.stream.writer(&writeBuffer);
     const writer = &streamWriter.interface;
 
     mainLoop:while (true) {
@@ -160,19 +162,7 @@ fn handler(user: User, arenaAlloc: std.mem.Allocator) !void {
 }
 
 fn normalizeLine(line: []const u8) []const u8 {
-    var start: usize = 0;
-    var end: usize = line.len;
-
-    if (end >= 2 and line[end - 2] == '\r' and line[end - 1] == '\n') {
-        end -= 2;
-    } else if (end > 0 and (line[end - 1] == '\r' or line[end - 1] == '\n')) {
-        end -= 1;
-    }
-    while (start < end and (line[start] == '\r' or line[start] == '\n')) {
-        start += 1;
-    }
-
-    return line[start..end];
+    return std.mem.trim(u8, line, "\r\n ");
 }
 
 fn handleSet(

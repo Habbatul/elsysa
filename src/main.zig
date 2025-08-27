@@ -3,7 +3,7 @@ const std = @import("std");
 pub const User = struct {
     conn: std.net.Server.Connection,
     store: *std.StringHashMap(*Entry),
-    storeMutex: *std.Thread.Mutex,
+    storeMutex: *std.Thread.RwLock,
     allocator: std.mem.Allocator,
 };
 
@@ -47,7 +47,7 @@ pub fn main() !void {
 
     const allocator = std.heap.raw_c_allocator;
     var store = std.StringHashMap(*Entry).init(allocator);
-    var mutex: std.Thread.Mutex = .{};
+    var mutex: std.Thread.RwLock = .{};
 
     var addr = try std.net.Address.parseIp("0.0.0.0", 6060);
     var server = try addr.listen(.{.kernel_backlog = 1024});
@@ -227,9 +227,9 @@ fn handleGet(
 ) !void {
     const key = header.key;
 
-    user.storeMutex.lock();
+    user.storeMutex.lockShared();
     const result = user.store.get(key);
-    user.storeMutex.unlock();
+    user.storeMutex.unlockShared();
 
     if (result) |val| {
         try writer.print("{s} {s} {d}\r\n", .{ val.key, val.flags, val.bytes });

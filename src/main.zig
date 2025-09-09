@@ -1,3 +1,4 @@
+
 const std = @import("std");
 
 pub const User = struct {
@@ -40,6 +41,7 @@ const Header = struct {
     }
 };
 
+const snapshot = @import("gen_snapshot.zig");
 
 pub fn main() !void {
     // var gpa:std.heap.GeneralPurposeAllocator(.{.thread_safe = true, .MutexType = std.Thread.Mutex,}) = .init;
@@ -67,19 +69,80 @@ pub fn main() !void {
         // if (gpa.deinit() == .leak){}
     }
 
-    while (true) {
-        const user = User{
-            .conn = server.accept() catch |err| {
-                std.debug.print("Error: {}\n", .{err});
-                break;
-            },
-            .store = &store,
-            .storeMutex = &mutex,
-            .allocator = allocator,
-        };
-        
+    const getWibDateTime = struct {
+        fn fromTimestamp(utcTimestamp: i64) struct {day:u9, hour:u5, minute:u6} {
+            const wibTimestamp = utcTimestamp +  (7 * 60 * 60);
+            const epochSeconds = std.time.epoch.EpochSeconds{.secs = @intCast(wibTimestamp)};
+            
+            const daySeconds = epochSeconds.getDaySeconds();
+            const yearDay = epochSeconds.getEpochDay().calculateYearDay();
 
-        try pool.spawn(handlerCannotErr, .{user});
+            return .{
+                .day = yearDay.day,
+                .hour = daySeconds.getHoursIntoDay(),
+                .minute = daySeconds.getMinutesIntoHour(),
+            };
+        }
+    }.fromTimestamp;
+
+    const SNAPSHOT_HOUR: u5 = 19;
+    const SNAPSHOT_MINUTE:u8 = 15;
+
+    const initialWibTime = getWibDateTime(std.time.timestamp());
+    var lastSnapshotDay: u9 = initialWibTime.day;
+    var snapshotTakenToday: bool = if (initialWibTime.hour > SNAPSHOT_HOUR or 
+        (initialWibTime.hour == SNAPSHOT_HOUR and initialWibTime.minute >= SNAPSHOT_MINUTE)) true else false;
+
+    if (snapshotTakenToday) std.log.info("Waktu snapshot sudah lewat", .{});
+
+    while (true) {
+        var pollFds = [_] std.posix.pollfd{
+            .{
+                .fd = server.stream.handle,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            },
+        };       
+
+        const numEvents = std.posix.poll(&pollFds, 1000) catch |err| {
+            std.log.err("ada error bro: {}", .{err});
+            continue;
+        };
+
+        if (numEvents > 0) {
+            //cuma jangan mati ae ketika ada error
+            const user = User{
+                .conn = server.accept() catch |err| {
+                    std.debug.print("Error: {}\n", .{err});
+                    continue;
+                },
+                .store = &store,
+                .storeMutex = &mutex,
+                .allocator = allocator,
+            };
+            
+
+            try pool.spawn(handlerCannotErr, .{user});
+
+        } else {
+            const wib = getWibDateTime(std.time.timestamp());
+
+            if (wib.day != lastSnapshotDay) {
+                lastSnapshotDay = wib.day;
+                snapshotTakenToday = false;
+                std.log.info("hari ini telah berganti jadwal snapshot direset", .{});
+            }
+
+            if (wib.day == SNAPSHOT_HOUR and wib.minute == SNAPSHOT_MINUTE and !snapshotTakenToday) {
+                snapshot.saveSnapshot(&store, &mutex) catch |err| {
+                    std.log.err("Gagal simpan snapshot: {}", .{err});
+                };
+                snapshotTakenToday = true;
+            }
+            
+
+        }
+
     }
 }
 
@@ -91,7 +154,7 @@ fn handlerCannotErr(user: User) void {
     const userPtr = arenaAllocator.create(User) catch |err| {
         std.log.err("ada error di alloc user struct {}\n", .{err});
         return;
-    }; 
+    };
 
     userPtr.* = user;
 
@@ -174,17 +237,18 @@ fn handleSet(
 ) !void {
     var valueBuf = try arenaAlloc.alloc(u8, header.bytes + 2);
     try reader.*.readSliceAll(valueBuf);
+    // const valueBuf = try reader.*.readAlloc(arenaAlloc, header.bytes+2 );
 
     if (!(valueBuf[header.bytes] == '\r' and valueBuf[header.bytes + 1] == '\n')) {
         try writer.print("-ERR value must end with \\r\\n\r\n", .{});
         return;
     }
 
+
     const value = valueBuf[0..header.bytes];
 
     user.storeMutex.lock();
     defer user.storeMutex.unlock();
-
 
     const keyCpy = try user.allocator.dupe(u8, header.key);
     const valCpy = try user.allocator.dupe(u8, value);
@@ -217,7 +281,8 @@ fn handleSet(
         user.allocator.destroy(oldEntry.value);
     }
 
-    try writer.print("+OK\r\n", .{});
+    // try writer.print("+OK\r\n", .{});
+    try writer.*.writeAll("+OK\r\n");
 }
 
 fn handleGet(

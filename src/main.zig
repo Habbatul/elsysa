@@ -69,32 +69,14 @@ pub fn main() !void {
         // if (gpa.deinit() == .leak){}
     }
 
-    const getWibDateTime = struct {
-        fn fromTimestamp(utcTimestamp: i64) struct {day:u9, hour:u5, minute:u6} {
-            const wibTimestamp = utcTimestamp +  (7 * 60 * 60);
-            const epochSeconds = std.time.epoch.EpochSeconds{.secs = @intCast(wibTimestamp)};
-            
-            const daySeconds = epochSeconds.getDaySeconds();
-            const yearDay = epochSeconds.getEpochDay().calculateYearDay();
+    snapshot.loadSnapshot(allocator, &store) catch |err| {
+        std.log.err("gagal memuat snapshot: {}", .{err});
+        return err;
+    };
 
-            return .{
-                .day = yearDay.day,
-                .hour = daySeconds.getHoursIntoDay(),
-                .minute = daySeconds.getMinutesIntoHour(),
-            };
-        }
-    }.fromTimestamp;
-
-    const SNAPSHOT_HOUR: u5 = 19;
-    const SNAPSHOT_MINUTE:u8 = 15;
-
-    const initialWibTime = getWibDateTime(std.time.timestamp());
-    var lastSnapshotDay: u9 = initialWibTime.day;
-    var snapshotTakenToday: bool = if (initialWibTime.hour > SNAPSHOT_HOUR or 
-        (initialWibTime.hour == SNAPSHOT_HOUR and initialWibTime.minute >= SNAPSHOT_MINUTE)) true else false;
-
-    if (snapshotTakenToday) std.log.info("Waktu snapshot sudah lewat", .{});
-
+    const SNAPSHOT_INTERVAL_SECONDS: i64 = 30; //sekitar 30 menit
+    var lasSnapshotTimestamp = std.time.timestamp();
+    
     while (true) {
         var pollFds = [_] std.posix.pollfd{
             .{
@@ -120,27 +102,18 @@ pub fn main() !void {
                 .storeMutex = &mutex,
                 .allocator = allocator,
             };
-            
 
             try pool.spawn(handlerCannotErr, .{user});
 
         } else {
-            const wib = getWibDateTime(std.time.timestamp());
-
-            if (wib.day != lastSnapshotDay) {
-                lastSnapshotDay = wib.day;
-                snapshotTakenToday = false;
-                std.log.info("hari ini telah berganti jadwal snapshot direset", .{});
-            }
-
-            if (wib.day == SNAPSHOT_HOUR and wib.minute == SNAPSHOT_MINUTE and !snapshotTakenToday) {
+            const currentTimestamp = std.time.timestamp();
+            if (currentTimestamp - lasSnapshotTimestamp >= SNAPSHOT_INTERVAL_SECONDS) {
                 snapshot.saveSnapshot(&store, &mutex) catch |err| {
                     std.log.err("Gagal simpan snapshot: {}", .{err});
                 };
-                snapshotTakenToday = true;
-            }
-            
 
+                lasSnapshotTimestamp = currentTimestamp;
+            }
         }
 
     }

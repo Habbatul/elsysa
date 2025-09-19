@@ -1,4 +1,3 @@
-
 const std = @import("std");
 
 pub const User = struct {
@@ -52,7 +51,16 @@ pub fn main() !void {
     var mutex: std.Thread.RwLock = .{};
 
     var addr = try std.net.Address.parseIp("0.0.0.0", 6060);
-    var server = try addr.listen(.{.kernel_backlog = 1024});
+    // var server = try addr.listen(.{.kernel_backlog = 1024});
+    const socketType: u32 = std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK;
+    const protocol = std.posix.IPPROTO.TCP;
+    const listener = try std.posix.socket(addr.any.family, socketType, protocol);
+    errdefer std.posix.close(listener);
+
+    try std.posix.setsockopt(listener, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
+    try std.posix.bind(listener, &addr.any, addr.getOsSockLen());
+    try std.posix.listen(listener, 1024);
+
     std.debug.print("🔴 Listening on 0.0.0.0:6060\n", .{});
 
     const threadCount = try std.Thread.getCpuCount();
@@ -63,7 +71,8 @@ pub fn main() !void {
     });
 
     defer {
-        server.deinit();
+        // server.deinit();
+        std.posix.close(listener);
         store.deinit();
         pool.deinit();
         // if (gpa.deinit() == .leak){}
@@ -74,49 +83,72 @@ pub fn main() !void {
         return err;
     };
 
-    const SNAPSHOT_INTERVAL_SECONDS: i64 = 30; //sekitar 30 menit
-    var lasSnapshotTimestamp = std.time.timestamp();
-    
+    const SNAPSHOT_INTERVAL_SECONDS: i64 = 30 * 60; //sekitar 30 menit
+    var lastSnapshotTimestamp = std.time.timestamp();
+   
     while (true) {
+
         var pollFds = [_] std.posix.pollfd{
             .{
-                .fd = server.stream.handle,
+                .fd = listener,
+                // .fd = server.stream.handle,
                 .events = std.posix.POLL.IN,
                 .revents = 0,
             },
-        };       
+        };  
 
-        const numEvents = std.posix.poll(&pollFds, 1000) catch |err| {
+        _ = std.posix.poll(&pollFds, 1000) catch |err| {
             std.log.err("ada error bro: {}", .{err});
             continue;
         };
 
-        if (numEvents > 0) {
-            //cuma jangan mati ae ketika ada error
-            const user = User{
-                .conn = server.accept() catch |err| {
-                    std.debug.print("Error: {}\n", .{err});
-                    continue;
-                },
-                .store = &store,
-                .storeMutex = &mutex,
-                .allocator = allocator,
-            };
+        if (pollFds[0].revents & std.posix.POLL.IN != 0) {
 
-            try pool.spawn(handlerCannotErr, .{user});
+                const socket = std.posix.accept(listener, null, null, std.posix.SOCK.CLOEXEC) catch |err| {
+                    if (err == error.WouldBlock) continue;
+
+                    std.debug.print("error accept: {}\n", .{err});
+                    continue;
+                };
+
+                const connection = std.net.Server.Connection{
+                    .stream = .{ .handle = socket },
+                    .address = undefined,
+                };
+
+                const user = User{
+                    .conn = connection,
+                    // .conn = server.accept() catch |err| {
+                    //     std.debug.print("Error: {}\n", .{err});
+                    //     continue;
+                    // },
+                    .store = &store,
+                    .storeMutex = &mutex,
+                    .allocator = allocator,
+                };
+
+                try pool.spawn(handlerCannotErr, .{user});
+
 
         } else {
             const currentTimestamp = std.time.timestamp();
-            if (currentTimestamp - lasSnapshotTimestamp >= SNAPSHOT_INTERVAL_SECONDS) {
-                snapshot.saveSnapshot(&store, &mutex) catch |err| {
-                    std.log.err("Gagal simpan snapshot: {}", .{err});
-                };
-
-                lasSnapshotTimestamp = currentTimestamp;
+            if (currentTimestamp - lastSnapshotTimestamp >= SNAPSHOT_INTERVAL_SECONDS) { 
+                try pool.spawn(saveSnapshot, .{&store, &mutex});
+                lastSnapshotTimestamp = currentTimestamp;
             }
+
         }
 
     }
+}
+
+fn saveSnapshot(
+    store: anytype,
+    mutex: anytype,
+) void {
+    snapshot.saveSnapshot(store, mutex) catch |err| {
+        std.log.err("Gagal simpan snapshot: {}", .{err});
+    };
 }
 
 fn handlerCannotErr(user: User) void {
